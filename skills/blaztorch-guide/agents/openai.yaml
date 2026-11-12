@@ -1,0 +1,6 @@
+interface:
+  display_name: "炬火 AI 赛事与学习顾问"
+  short_description: "从炬火查赛事、课程与获奖案例，结合能力和时间推荐参赛方向"
+  default_prompt: "使用 $blaztorch-guide 了解我的经验与时间安排，从炬火官网筛选适合的黑客松，并推荐补强资源和获奖案例。"
+policy:
+  allow_implicit_invocation: true
