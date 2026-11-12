@@ -35,6 +35,8 @@ npx skills add SanCalibur/blaztorch-skill --skill blaztorch-guide
 
 ## 读取方式与边界
 
+**脚本搬运数据，agent承担全部判断。** 固定脚本只做公开页面请求、解析、缓存、字段整理、分页和显式条件查询；能力评估、时间状态判断、资格核验、难度判断、作品去重、匹配及推荐排序均由使用技能的agent完成。脚本不接收个人能力档案，没有`recommend`或`profile-template`命令。
+
 当前版本从官网公开页面向访客发送的展示数据读取，不依赖受保护的CMS接口，不附带过时的全量数据快照。网页格式变化时明确报错并切换浏览器读取；不会把解析失败当成没有结果。
 
 公共数据缓存15分钟，最多40份页面；搜索通常返回5项，获奖作品最多查看3页。能力资料不自动持久保存，也不会发送到炬火或报名平台。脚本只向炬火公开资源页面发出GET请求，不访问管理员接口，不提交报名、不付款、不改官网。
@@ -47,11 +49,11 @@ npx skills add SanCalibur/blaztorch-skill --skill blaztorch-guide
 python skills/blaztorch-guide/scripts/blaztorch.py search --kind events --query 智能体 --limit 5
 python skills/blaztorch-guide/scripts/blaztorch.py search --kind learning --query RAG --limit 5
 python skills/blaztorch-guide/scripts/blaztorch.py search --kind winners --query Noddle --limit 1
-python skills/blaztorch-guide/scripts/blaztorch.py profile-template
-python skills/blaztorch-guide/scripts/blaztorch.py --refresh recommend --profile profile.json --limit 5
+python skills/blaztorch-guide/scripts/blaztorch.py search --kind events --offset 5 --limit 5
+python skills/blaztorch-guide/scripts/blaztorch.py --refresh detail --kind events --id <公开编号>
 ```
 
-`profile.json`是当前任务中按具体经历形成的资料，可用`profile-template`查看空结构，也可通过`--profile -`从标准输入临时传入。不要把个人资料加入公开仓库。
+`--status`、`--level`、`--access`只精确匹配官网现有字段，不解释它们；不指定时保留所有值。关键词采用字面匹配，不自动联想同义词。搜索保持来源顺序，agent可查看更多页面后自行选出推荐。官网给出的状态、日程和奖项都保留原始字段与来源，交由agent核对。
 
 字段与浏览器备用路线见[官网读取说明](skills/blaztorch-guide/references/site-access.md)，评估方法见[能力与匹配说明](skills/blaztorch-guide/references/assessment.md)。
 
@@ -62,7 +64,7 @@ python -m unittest discover -s tests -v
 python -m compileall -q skills/blaztorch-guide/scripts
 ```
 
-离线测试覆盖页面格式、长中文文本、公开字段边界、缓存、时区与截止、已报名例外、能力证据和匹配解释。真实官网连接可使用上述只读命令验证；不把联网可用性作为离线测试通过的前提。
+离线测试覆盖页面格式、长中文文本、公开字段边界、缓存、分页，以及日期/状态原样保留、不预筛已结束赛事、不按URL合并作品等数据搬运边界。agent判断场景见[行为验收案例](tests/agent-scenarios.md)，需在使用技能的agent会话中检验，不能用脚本打分代替。真实官网连接可使用上述只读命令验证。
 
 ## 许可
 

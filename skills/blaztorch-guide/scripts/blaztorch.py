@@ -3,13 +3,10 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
 import json
-from pathlib import Path
 import sys
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote
 
-from matching import DIMENSIONS, event_state, recommend, validate_profile
 from blaztorch_source import Client, ORIGIN, SourceError
 
 RESOURCE_FIELDS = ('id', 'category', 'title', 'provider', 'url', 'summary', 'tags', 'status',
@@ -19,26 +16,22 @@ RESOURCE_FIELDS = ('id', 'category', 'title', 'provider', 'url', 'summary', 'tag
                    'publicDetails', 'eventSchedule', 'publishedTimeline', 'timelineReview', 'eventView')
 PROJECT_FIELDS = ('id', 'eventId', 'name', 'summary', 'topic', 'kind', 'team', 'projectUrl', 'productUrl',
                   'codeUrl', 'demoUrl', 'technologies', 'members', 'awards', 'checkedAt', 'linkStatus', 'linkCheckedAt')
-ALIASES = {'智能体': ('智能体', 'agent'), 'agent': ('智能体', 'agent'),
-           '大模型': ('大模型', '大语言模型', 'llm', 'language model'),
-           'llm': ('大模型', '大语言模型', 'llm', 'language model'),
-           'rag': ('rag', '检索增强'), '入门': ('入门', 'beginner', '基础')}
-
 
 def public_item(item, project=False):
     return {k: item[k] for k in (PROJECT_FIELDS if project else RESOURCE_FIELDS) if k in item}
 
 
-def relevant(item, query):
+def literal_match(item, query):
+    """Case-insensitive literal token matching, without semantic expansion."""
     text = json.dumps(item, ensure_ascii=False).casefold()
-    return all(any(alias in text for alias in ALIASES.get(word.casefold(), (word.casefold(),)))
-               for word in query.split())
+    return all(word.casefold() in text for word in query.split())
 
 
 def compact(item, project=False):
     fields = (('id', 'eventId', 'name', 'summary', 'topic', 'kind', 'projectUrl', 'codeUrl', 'demoUrl', 'awards', 'checkedAt')
               if project else ('id', 'category', 'title', 'provider', 'summary', 'url', 'tags', 'participation',
-                               'level', 'access', 'languages', 'checkedDate'))
+                               'level', 'access', 'languages', 'checkedDate', 'status', 'eventView',
+                               'eventSchedule', 'publishedTimeline', 'timelineReview'))
     result = {k: item[k] for k in fields if k in item}
     result['websiteUrl'] = (ORIGIN + '/resources/winners/' + quote(item['id'], safe='') if project else
                             ORIGIN + '/resources?tab=' + ('learning' if item.get('category') == 'learning' else 'hackathon') +
@@ -46,61 +39,55 @@ def compact(item, project=False):
     return result
 
 
-def canonical(project):
-    url = project.get('projectUrl')
-    if not url:
-        return project['id']
-    value = urlsplit(url)
-    return value.netloc.lower().removeprefix('www.') + value.path.rstrip('/')
+def result_reference(props, item_id):
+    """Copy an existing source association, without interpreting its meaning."""
+    record = props.get('awardEvents', {}).get(item_id)
+    if record is None:
+        return None
+    return {k: record[k] for k in ('id', 'title', 'sourceUrl', 'checkedAt', 'scopeNote', 'projectCount') if k in record}
 
 
-def search(client, args, now):
+def search(client, args):
     if args.kind == 'winners':
-        found, seen, reports, total, visited = [], set(), [], 0, 0
-        for page in range(1, args.pages + 1):
+        found, reports, source_pages, total = [], [], [], 0
+        for page in range(args.page, args.page + args.pages):
             props, meta = client.winners(args.query, page, args.code)
             reports.append(meta)
             total = props.get('total', 0)
-            visited += 1
+            source_pages.append({'page': props.get('page'), 'pages': props.get('pages')})
             for raw in props['items']:
-                key = canonical(raw)
-                if key not in seen:
-                    seen.add(key)
-                    item = public_item(raw, True)
-                    found.append(item if args.details else compact(item, True))
+                item = public_item(raw, True)
+                found.append(item if args.details else compact(item, True))
             if len(found) >= args.limit or page >= props.get('pages', page):
                 break
-        return {'kind': 'winners', 'sources': reports, 'websiteTotalMatches': total, 'pagesRead': visited,
-                'coverage': '仅所列公开查询页面；非对全部获奖项目的综合排名', 'items': found[:args.limit]}
+        return {'kind': 'winners', 'sources': reports, 'websiteTotalMatches': total, 'sourcePages': source_pages,
+                'order': 'website_order', 'items': found[:args.limit]}
     props, meta = client.resources()
     category = 'hackathon' if args.kind == 'events' else 'learning'
-    results, states = [], {}
+    results = []
     for raw in props['items']:
-        if raw.get('category') != category or not relevant(raw, args.query):
+        if raw.get('category') != category or not literal_match(raw, args.query):
             continue
         item = public_item(raw)
-        if args.kind == 'events':
-            state = event_state(item, now, item['id'] in props.get('awardEvents', {}))
-            if args.state != 'all' and state['group'] != args.state:
-                continue
-            states[item['id']] = state
+        if args.status and item.get('status') != args.status:
+            continue
         if args.level and item.get('level') != args.level:
             continue
-        if args.free and item.get('access') != 'free':
+        if args.access and item.get('access') != args.access:
             continue
         results.append(item)
-    results.sort(key=lambda r: (r.get('checkedDate', ''), r.get('id', '')), reverse=True)
     output = []
-    for item in results[:args.limit]:
+    for item in results[args.offset:args.offset + args.limit]:
         row = item if args.details else compact(item)
-        if item['id'] in states:
-            row = {**row, 'calendar': states[item['id']]}
+        if category == 'hackathon':
+            row = {**row, 'publishedAwardResult': result_reference(props, item['id'])}
         output.append(row)
-    return {'kind': args.kind, 'source': meta, 'catalogAsOf': props.get('asOf'), 'evaluatedAt': now.isoformat(),
-            'totalMatches': len(results), 'items': output}
+    return {'kind': args.kind, 'source': meta, 'catalogAsOf': props.get('asOf'), 'order': 'website_order',
+            'totalMatches': len(results), 'offset': args.offset,
+            'hasMore': args.offset + len(output) < len(results), 'items': output}
 
 
-def detail(client, args, now):
+def detail(client, args):
     if args.kind == 'winners':
         # The public item page does not deliver a client-side data component.
         # Find its entry through a bounded name query supplied by the user/agent.
@@ -120,16 +107,9 @@ def detail(client, args, now):
         if item:
             result = {'source': meta, 'catalogAsOf': props.get('asOf'), 'item': public_item(item)}
             if category == 'hackathon':
-                result['calendar'] = event_state(item, now, item['id'] in props.get('awardEvents', {}))
+                result['publishedAwardResult'] = result_reference(props, item['id'])
             return result
     raise SourceError('No matching item in the inspected public pages; use the website detail link')
-
-
-def profile_template():
-    return {'skills': {k: {'level': None, 'evidence': ''} for k in DIMENSIONS}, 'interests': [],
-            'languages': [], 'hours_per_week': None, 'team_size': None,
-            'participation': [], 'registered_event_ids': [],
-            'notes': '示例空模板：未知保留null，按具体经历补充；资料只在当前会话使用，保存前征得使用者同意。'}
 
 
 def main():
@@ -141,20 +121,18 @@ def main():
     s.add_argument('--kind', choices=['events', 'learning', 'winners'], required=True)
     s.add_argument('--query', default='')
     s.add_argument('--limit', type=int, default=5)
+    s.add_argument('--offset', type=int, default=0, help='赛事/课程在字面匹配结果中的偏移量')
+    s.add_argument('--page', type=int, default=1, help='获奖作品查询的起始页')
     s.add_argument('--pages', type=int, default=1, help='获奖作品最多查询3页')
-    s.add_argument('--state', choices=['active', 'ended', 'unknown', 'all'], default='active')
+    s.add_argument('--status', help='按官网原始status字段精确匹配，不推算当前状态')
     s.add_argument('--level', choices=['beginner', 'intermediate', 'advanced', 'mixed'])
-    s.add_argument('--free', action='store_true', help='学习资源仅限公开材料免费')
+    s.add_argument('--access', choices=['free', 'free_account', 'freemium'], help='按官网原始access字段精确匹配')
     s.add_argument('--code', action='store_true', help='获奖作品需有目录记录的代码入口，仍需另行核对链接')
     s.add_argument('--details', action='store_true')
     d = commands.add_parser('detail')
     d.add_argument('--kind', choices=['events', 'learning', 'winners'], required=True)
     d.add_argument('--id', required=True)
     d.add_argument('--query', default='')
-    r = commands.add_parser('recommend', help='按能力证据筛选赛事候选，资格仍需AI核对')
-    r.add_argument('--profile', type=Path, required=True)
-    r.add_argument('--limit', type=int, default=5)
-    commands.add_parser('profile-template')
     args = parser.parse_args()
     if args.refresh and args.offline:
         parser.error('--refresh与--offline不能同时使用')
@@ -162,29 +140,19 @@ def main():
         parser.error('--limit应为1至20')
     if hasattr(args, 'pages') and not 1 <= args.pages <= 3:
         parser.error('--pages应为1至3')
+    if hasattr(args, 'offset') and args.offset < 0:
+        parser.error('--offset不得为负数')
+    if hasattr(args, 'page') and args.page < 1:
+        parser.error('--page不得小于1')
+    if args.command == 'search':
+        if args.kind == 'winners' and (args.offset or args.status or args.level or args.access):
+            parser.error('获奖作品使用--page分页，不支持赛事/课程字段筛选')
+        if args.kind != 'winners' and (args.page != 1 or args.pages != 1 or args.code):
+            parser.error('--page、--pages、--code仅用于获奖作品')
     if len(getattr(args, 'query', '')) > 160:
         parser.error('--query最多160个字符')
     client = Client(refresh=args.refresh, offline=args.offline)
-    now = datetime.now(timezone.utc)
-    if args.command == 'profile-template':
-        result = profile_template()
-    elif args.command == 'search':
-        result = search(client, args, now)
-    elif args.command == 'detail':
-        result = detail(client, args, now)
-    else:
-        if str(args.profile) == '-':
-            content = sys.stdin.read(65537)
-        else:
-            if args.profile.stat().st_size > 65536:
-                raise ValueError('能力资料过大，应只包含最小必要字段')
-            content = args.profile.read_text('utf-8-sig')
-        if len(content.encode('utf-8')) > 65536:
-            raise ValueError('能力资料过大，应只包含最小必要字段')
-        profile = validate_profile(json.loads(content.lstrip('\ufeff')))
-        props, meta = client.resources()
-        result = recommend([public_item(i) for i in props['items']], props.get('awardEvents', {}), profile, now, args.limit)
-        result.update(source=meta, catalogAsOf=props.get('asOf'))
+    result = search(client, args) if args.command == 'search' else detail(client, args)
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

@@ -7,6 +7,12 @@ description: 从炬火官网查询黑客松、AI学习资源与获奖作品，�
 
 从 https://blaztorch.com 的公开内容帮助使用者选比赛、选学习资料、研究获奖案例。输出可追溯的推荐，区分已确认事实、能力推断和待核对条件。
 
+## 分工边界
+
+固定脚本只负责请求、解析、缓存、公开字段投影、分页及按agent明确指定的原始字段或字面关键词查询。它不接收能力档案，不重算赛事状态，不推断难度或资格，不做匹配、推荐排序、同义词扩展或作品实体合并。
+
+所有判断由使用本技能的agent承担：理解用户目标、设计检索词、解释日程与时区、核对资格、评估能力、识别重复作品、比较适配程度、选择和排列推荐。官网已有的`status/eventView`等属于来源记录；原样返回不代表脚本重新确认其含义或时效。
+
 ## 读取公开资料
 
 有 Python 3.10+ 时使用同目录 `scripts/blaztorch.py`。将下面的 `<skill>` 替换为本技能目录的绝对路径，按环境使用 `python`、`python3` 或 `py -3`。
@@ -18,7 +24,7 @@ python <skill>/scripts/blaztorch.py search --kind winners --query education --co
 python <skill>/scripts/blaztorch.py detail --kind events --id <公开编号>
 ```
 
-默认只输出少量结果。课程与赛事共用一次官网读取和15分钟缓存；获奖作品按需求搜索，最多3页，避免把整个目录灌入上下文。正式讨论报名时加 `--refresh` 放在子命令前。来源字段的 `retrievedAt` 是读取时间，`checkedDate/checkedAt` 是资料核对时间；二者不能混同。
+默认只输出少量结果，保持官网原有顺序，不预先排除任何赛事状态。课程与赛事共用一次官网读取和15分钟缓存；用`--offset`翻页，获奖作品用`--page/--pages`按需读取，每次最多3页。检索词和后续扩展由agent决定：中文“智能体”不会被脚本自动改写成英文“agent”。正式讨论报名时加 `--refresh` 放在子命令前。来源字段的 `retrievedAt` 是读取时间，`checkedDate/checkedAt` 是资料核对时间；二者不能混同。
 
 首次需要理解字段、参数或读取失败时，读 [references/site-access.md](references/site-access.md)。没有 Python 或页面结构变化时，用可用浏览工具读取 `/resources`、`?tab=learning`、`?tab=winners&q=关键词` 与项目详情。不得假装访问成功，或把解析失败说成没有比赛。技能不需要网站账户、数据库、GitHub令牌或管理员接口。
 
@@ -37,13 +43,7 @@ python <skill>/scripts/blaztorch.py detail --kind events --id <公开编号>
 
 关注可投入时间、个人或团队、线上或线下、语言、预算和设备。队友能力只有在用户提供时才计入；具体赛事涉及年龄、学生身份或地区时再问相关条件，不收集证件、学号或精确住址。
 
-可用 `profile-template` 获取空JSON结构，或阅读引用文件中的示例。脚本初筛：
-
-```sh
-python <skill>/scripts/blaztorch.py --refresh recommend --profile <当前任务资料.json> --limit 5
-```
-
-`recommend` 是有解释的辅助初筛，不是最终资格裁定。模型须结合完整规则、本人或团队可承担的工作、真实比赛时间进一步判断。默认不持久保存能力资料；跨会话档案应在用户需要时另行约定。
+在会话内整理能力证据，表达形式按任务选择，不必为了运行工具填写固定问卷或JSON。资料不传给读取脚本。agent须结合完整规则、本人或团队可承担的工作、真实比赛时间自行判断，不靠关键词套用固定能力门槛或预设权重。默认不持久保存能力资料；跨会话档案应在用户需要时另行约定。
 
 ## 推荐报名之前
 

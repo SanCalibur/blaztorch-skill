@@ -1,32 +1,17 @@
-from datetime import datetime, timedelta, timezone
 from io import BytesIO
 import json
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
+import subprocess
 import unittest
 from unittest.mock import patch
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'skills/blaztorch-guide/scripts'
 sys.path.insert(0, str(SCRIPTS))
 from blaztorch_source import Client, SourceError, check_url, parse_props
-from matching import aware, boundaries, event_state, recommend, validate_profile, DIMENSIONS
-from blaztorch import canonical, compact, public_item, relevant
-
-NOW = datetime(2026, 11, 12, 8, tzinfo=timezone.utc)
-
-
-def moment(raw):
-    if 'T' in raw:
-        return {'raw': raw, 'utc': raw, 'precision': 'instant', 'date': raw[:10], 'source': 'https://example.org/rules'}
-    return {'raw': raw, 'date': raw, 'precision': 'date', 'source': 'https://example.org/rules'}
-
-
-def event(**dates):
-    return {'id': 'O-test', 'title': 'AI application event', 'category': 'hackathon', 'status': 'open',
-            'summary': '智能体应用原型', 'requirements': '公开规则待复核', 'participation': 'online',
-            'eventSchedule': {'dates': dates, 'conflicts': [], 'verifiedAt': '2026-11-11T00:00:00Z',
-                              'validUntil': '2026-11-13T00:00:00Z'}}
+from blaztorch import public_item, literal_match, search, detail
 
 
 def html(component='ResourceExplorer', items=None, long_text=None):
@@ -107,109 +92,97 @@ class CacheTests(unittest.TestCase):
                 Client(Path(temp), offline=True).resources()
 
 
-class TimeTests(unittest.TestCase):
-    def test_exact_offsets_and_midnight(self):
-        m = moment('2026-11-28T00:00:00+01:00')
-        m['utc'] = '2026-11-27T23:00:00Z'
-        self.assertEqual(boundaries(m)[0], aware('2026-11-27T23:00:00Z'))
-        item = event(submissionClose=m)
-        self.assertEqual(event_state(item, aware('2026-11-27T23:00:00Z'))['group'], 'ended')
-
-    def test_no_host_timezone_for_naive_clock(self):
-        self.assertIsNone(boundaries(moment('2026-11-20T12:00:00')))
-
-    def test_inconsistent_utc_is_not_a_fact(self):
-        m = moment('2026-11-20T12:00:00+01:00')
-        m['utc'] = '2026-11-20T12:00:00Z'
-        self.assertIsNone(boundaries(m))
-
-    def test_date_only_preserves_full_timezone_uncertainty(self):
-        early, late = boundaries(moment('2026-11-12'))
-        self.assertEqual(early, aware('2026-11-11T10:00:00Z'))
-        self.assertEqual(late, aware('2026-11-13T12:00:00Z'))
-        self.assertEqual(event_state(event(submissionClose=moment('2026-11-12')), NOW)['group'], 'unknown')
-
-    def test_invalid_dates_are_not_normalized(self):
-        self.assertIsNone(boundaries(moment('2026-02-30')))
-
-    def test_results_or_closed_flag_cannot_be_resurrected(self):
-        item = event(submissionClose=moment('2027-01-01T00:00:00Z'))
-        self.assertEqual(event_state(item, NOW, True)['group'], 'ended')
-        item['status'] = 'closed'
-        self.assertEqual(event_state(item, NOW)['group'], 'ended')
-
-    def test_submission_deadline_precedes_judging(self):
-        item = event(submissionClose=moment('2026-11-10T00:00:00Z'), eventEnd=moment('2026-12-01T00:00:00Z'))
-        self.assertEqual(event_state(item, NOW)['stage'], 'submission_closed')
-
-    def test_earlier_event_end_does_not_override_future_submission(self):
-        item = event(submissionClose=moment('2026-11-20T00:00:00Z'), eventEnd=moment('2026-11-10T00:00:00Z'))
-        self.assertEqual(event_state(item, NOW)['group'], 'active')
-
-    def test_registration_is_separate(self):
-        item = event(registrationClose=moment('2026-11-10T00:00:00Z'), submissionClose=moment('2026-11-20T00:00:00Z'))
-        self.assertEqual(event_state(item, NOW)['joinability'], 'registered_only')
-
-    def test_conflicts_and_postponement_do_not_reuse_dates(self):
-        item = event(submissionClose=moment('2026-11-20T00:00:00Z'))
-        item['eventSchedule']['conflicts'] = ['submissionClose']
-        self.assertEqual(event_state(item, NOW)['group'], 'unknown')
-        item['eventSchedule']['special'] = 'postponed'
-        self.assertEqual(event_state(item, NOW)['stage'], 'postponed')
-
-    def test_no_dates_no_claim_of_open_registration(self):
-        state = event_state(event(), NOW)
-        self.assertEqual(state['group'], 'unknown')
-        self.assertFalse(state['verifiedRegistration'])
-
-    def test_old_observation_does_not_become_fresh(self):
-        item = event(submissionClose=moment('2026-11-20T00:00:00Z'))
-        item['eventSchedule']['validUntil'] = '2026-11-01T00:00:00Z'
-        self.assertEqual(event_state(item, NOW)['freshness'], 'stale')
+def arguments(**changes):
+    values = {'kind': 'events', 'query': '', 'limit': 20, 'offset': 0, 'page': 1,
+              'pages': 1, 'status': None, 'level': None, 'access': None, 'code': False, 'details': False}
+    return SimpleNamespace(**{**values, **changes})
 
 
-class MatchTests(unittest.TestCase):
-    def test_assessment_requires_evidence_and_valid_levels(self):
-        for profile in ({'skills': {'ai': {'level': 4, 'evidence': 'some'}}},
-                        {'skills': {'ai': {'level': 1, 'evidence': ''}}},
-                        {'skills': {'ai': {'level': True, 'evidence': 'some'}}}):
-            with self.assertRaises(ValueError):
-                validate_profile(profile)
+class PublicFixture:
+    def __init__(self):
+        self.items = [
+            {'id': 'old-open', 'category': 'hackathon', 'title': 'AI agent event', 'status': 'open',
+             'checkedDate': '2026-10-01', 'summary': 'source description',
+             'eventSchedule': {'dates': {'submissionClose': {'raw': '2000-01-01', 'date': '2000-01-01', 'precision': 'date'}}, 'conflicts': ['submissionClose']}},
+            {'id': 'future-closed', 'category': 'hackathon', 'title': 'Same name', 'status': 'closed',
+             'checkedDate': '2026-11-12', 'deadline': '2099-01-01',
+             'eventView': {'status': 'unknown', 'note': 'conflicting source observation'}},
+            {'id': 'unknown', 'category': 'hackathon', 'title': 'Unknown event', 'status': 'unknown'},
+            {'id': 'course', 'category': 'learning', 'title': 'Beginner course', 'access': 'free_account', 'level': 'advanced'}]
 
-    def test_unknown_is_not_zero_or_a_skill_gap(self):
-        result = recommend([event(submissionClose=moment('2026-11-20T00:00:00Z'))], {}, {}, NOW)
-        candidate = result['candidates'][0]
-        self.assertEqual(candidate['skillGaps'], [])
-        self.assertEqual(len(candidate['unassessedSkills']), 6)
-        self.assertEqual(candidate['fit'], '需补充能力信息')
-        self.assertEqual(candidate['eligibility'], 'not_checked')
+    def resources(self):
+        return {'items': self.items, 'asOf': '2026-11-12', 'awardEvents': {
+            'old-open': {'id': 'old-open', 'sourceUrl': 'https://example.org/result',
+                         'checkedAt': '2026-11-10', 'projectCount': 2}}}, {'url': 'https://blaztorch.com/resources'}
 
-    def test_closed_registration_is_only_for_existing_entrants(self):
-        item = event(registrationClose=moment('2026-11-10T00:00:00Z'), submissionClose=moment('2026-11-20T00:00:00Z'))
-        self.assertEqual(recommend([item], {}, {}, NOW)['candidates'], [])
-        self.assertEqual(len(recommend([item], {}, {'registered_event_ids': ['O-test']}, NOW)['candidates']), 1)
+    def winners(self, query='', page=1, code=False):
+        self.request = (query, page, code)
+        return {'items': [{'id': 'first', 'name': 'Same work', 'projectUrl': 'https://example.org/work', 'eventId': 'event1'},
+                          {'id': 'second', 'name': 'Same work', 'projectUrl': 'https://example.org/work', 'eventId': 'event2'}],
+                'total': 2, 'page': page, 'pages': page}, {'url': 'https://blaztorch.com/resources?tab=winners'}
 
-    def test_unknown_dates_are_not_in_main_candidates(self):
-        result = recommend([event()], {}, {}, NOW)
-        self.assertFalse(result['candidates'])
-        self.assertEqual(len(result['needsDateCheck']), 1)
 
-    def test_no_available_time_does_not_trigger_registration_recommendation(self):
-        self.assertFalse(recommend([event()], {}, {'hours_per_week': 0}, NOW)['candidates'])
+class DataTransportTests(unittest.TestCase):
+    def test_all_statuses_returned_in_source_order_despite_dates(self):
+        result = search(PublicFixture(), arguments())
+        self.assertEqual([r['id'] for r in result['items']], ['old-open', 'future-closed', 'unknown'])
+        self.assertEqual(result['order'], 'website_order')
+        self.assertEqual(result['items'][0]['status'], 'open')
+        self.assertEqual(result['items'][0]['eventSchedule']['dates']['submissionClose']['raw'], '2000-01-01')
+        self.assertEqual(result['items'][1]['eventView']['status'], 'unknown')
+        for row in result['items']:
+            for computed in ('calendar', 'fit', 'skillGaps', 'eligibility', 'minimumMinutesToSubmission'):
+                self.assertNotIn(computed, row)
 
-    def test_interests_ordering_and_gaps_are_explained(self):
-        one = event(submissionClose=moment('2026-11-20T00:00:00Z'))
-        two = {**one, 'id': 'O-two', 'title': '数据科学与微调竞赛'}
-        profile = {'skills': {k: {'level': 1, 'evidence': '明确的教程经验'} for k in DIMENSIONS}, 'interests': ['数据科学']}
-        result = recommend([one, two], {}, profile, NOW)
-        self.assertEqual(result['candidates'][0]['id'], 'O-two')
-        self.assertTrue(result['candidates'][0]['skillGaps'])
+    def test_explicit_status_filter_is_literal_not_current_state(self):
+        result = search(PublicFixture(), arguments(status='closed', details=True))
+        self.assertEqual([r['id'] for r in result['items']], ['future-closed'])
+        self.assertEqual(result['items'][0]['deadline'], '2099-01-01')
 
-    def test_related_queries_and_canonical_duplicates(self):
-        self.assertTrue(relevant({'summary': 'AI agent course for beginner'}, '智能体 入门'))
-        self.assertEqual(canonical({'id': 'x', 'projectUrl': 'https://devpost.com/software/a/?ref=one'}),
-                         canonical({'id': 'y', 'projectUrl': 'https://devpost.com/software/a'}))
-        self.assertEqual(canonical({'id': 'z'}), 'z')
+    def test_no_implicit_synonyms_or_difficulty_inference(self):
+        fixture = PublicFixture()
+        self.assertFalse(literal_match({'title': 'AI agent for beginner'}, '智能体'))
+        self.assertTrue(literal_match({'title': 'AI agent for beginner'}, 'AGENT beginner'))
+        self.assertEqual(search(fixture, arguments(kind='learning', level='beginner'))['items'], [])
+        self.assertEqual(search(fixture, arguments(kind='learning', level='advanced'))['items'][0]['id'], 'course')
+
+    def test_access_filter_uses_only_original_field(self):
+        self.assertEqual(search(PublicFixture(), arguments(kind='learning', access='free'))['items'], [])
+        result = search(PublicFixture(), arguments(kind='learning', access='free_account'))
+        self.assertEqual(result['items'][0]['access'], 'free_account')
+
+    def test_offset_has_no_relevance_ranking(self):
+        result = search(PublicFixture(), arguments(offset=1, limit=1))
+        self.assertEqual(result['items'][0]['id'], 'future-closed')
+        self.assertEqual(result['totalMatches'], 3)
+        self.assertTrue(result['hasMore'])
+
+    def test_different_records_with_same_project_url_are_not_merged(self):
+        fixture = PublicFixture()
+        result = search(fixture, arguments(kind='winners', query='Same work', page=2, code=True))
+        self.assertEqual([p['id'] for p in result['items']], ['first', 'second'])
+        self.assertEqual(fixture.request, ('Same work', 2, True))
+        self.assertEqual(result['sourcePages'], [{'page': 2, 'pages': 2}])
+
+    def test_full_detail_does_not_resolve_conflicting_observations(self):
+        fixture = PublicFixture()
+        result = detail(fixture, arguments(id='future-closed'))
+        self.assertEqual(result['item'], public_item(fixture.items[1]))
+        self.assertNotIn('calendar', result)
+        self.assertEqual(result['item']['status'], 'closed')
+        self.assertEqual(result['item']['eventView']['status'], 'unknown')
+
+    def test_result_link_is_source_data_without_an_end_verdict(self):
+        result = detail(PublicFixture(), arguments(id='old-open'))
+        self.assertEqual(result['item']['status'], 'open')
+        self.assertEqual(result['publishedAwardResult']['sourceUrl'], 'https://example.org/result')
+        self.assertNotIn('calendar', result)
+
+    def test_recommendation_and_profile_commands_are_not_exposed(self):
+        for command in ('recommend', 'profile-template'):
+            result = subprocess.run([sys.executable, str(SCRIPTS / 'blaztorch.py'), command], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn('invalid choice', result.stderr)
 
 
 if __name__ == '__main__':

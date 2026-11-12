@@ -15,7 +15,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v6
-      - name: Test the public reader and recommendation boundaries
+      - name: Test the public reader and data transport boundaries
         run: python3 -m unittest discover -s tests -v
       - name: Check Python syntax
         run: python3 -m compileall -q skills/blaztorch-guide/scripts
